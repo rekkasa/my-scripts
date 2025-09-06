@@ -1,0 +1,407 @@
+#!/bin/bash
+
+# Quarto Course Website Setup Script
+# Run this script from inside the directory where you want to create your course project
+
+set -e  # Exit on any error
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Function to print colored output
+print_status() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Get course information from user
+read -p "Enter your course title: " COURSE_TITLE
+read -p "Enter your name: " AUTHOR_NAME
+read -p "Enter the number of initial lectures to create (default: 3): " NUM_LECTURES
+NUM_LECTURES=${NUM_LECTURES:-3}
+
+print_status "Creating Quarto course project structure..."
+
+# Create main directory structure
+print_status "Creating directory structure..."
+mkdir -p slides notes
+
+# Create docs directory (will be populated during rendering)
+mkdir -p docs
+
+print_status "Creating main configuration files..."
+
+# Create main _quarto.yml
+cat > _quarto.yml << EOF
+project:
+  type: website
+  output-dir: docs
+
+website:
+  title: "$COURSE_TITLE"
+  navbar:
+    left:
+      - text: "Home"
+        href: index.qmd
+      - text: "Slides"
+        href: slides-index.qmd
+      - text: "Notes"
+        href: notes/index.qmd
+
+format:
+  html:
+    theme: cosmo
+    css: styles.css
+    toc: true
+EOF
+
+# Create main index.qmd
+cat > index.qmd << EOF
+---
+title: "Welcome to $COURSE_TITLE"
+---
+
+# Course Overview
+
+Brief description of your course, objectives, and how to navigate the materials.
+
+## Quick Navigation
+
+- **[Slides](slides-index.qmd)**: Access all lecture presentations
+- **[Notes](notes/index.qmd)**: Read the complete course notes (also available as PDF)
+
+## Course Information
+
+Add syllabus, schedule, or other relevant information here.
+
+## About
+
+**Instructor:** $AUTHOR_NAME
+
+*This website was created using [Quarto](https://quarto.org/).*
+EOF
+
+# Create basic CSS file
+cat > styles.css << EOF
+/* Custom styles for the course website */
+
+.title {
+    color: #2c3e50;
+}
+
+.navbar {
+    background-color: #34495e;
+}
+
+/* Add your custom styles here */
+EOF
+
+print_status "Creating slides structure..."
+
+# Create slides metadata
+cat > slides/_metadata.yml << EOF
+format:
+  revealjs:
+    theme: default
+    transition: slide
+    background-transition: fade
+    highlight-style: github
+    incremental: true
+EOF
+
+# Create slides index
+print_status "Creating slides index page..."
+cat > slides-index.qmd << 'EOF'
+---
+title: "Lecture Slides"
+format: html
+---
+
+# Available Lectures
+
+Click on any lecture below to view the slides:
+
+EOF
+
+# Create individual lecture directories and files
+for i in $(seq 1 $NUM_LECTURES); do
+    LECTURE_NUM=$(printf "%02d" $i)
+    LECTURE_DIR="slides/lecture-$LECTURE_NUM"
+    
+    print_status "Creating lecture $i..."
+    mkdir -p "$LECTURE_DIR"
+    
+    cat > "$LECTURE_DIR/index.qmd" << EOF
+---
+title: "Lecture $i: Topic Title"
+format: 
+  revealjs:
+    incremental: true
+---
+
+# Lecture $i {.center}
+
+## Overview
+
+- Learning objective 1
+- Learning objective 2
+- Learning objective 3
+
+## Main Content
+
+Add your slide content here.
+
+## Summary
+
+- Key point 1
+- Key point 2
+- Key point 3
+
+## Questions?
+
+Thank you for your attention!
+EOF
+
+    # Add to slides index
+    echo "- [Lecture $i: Topic Title](slides/lecture-$LECTURE_NUM/index.qmd)" >> slides-index.qmd
+done
+
+# Add footer to slides index
+cat >> slides-index.qmd << EOF
+
+*More lectures will be added throughout the semester.*
+EOF
+
+print_status "Creating notes structure..."
+
+# Create notes _quarto.yml
+cat > notes/_quarto.yml << EOF
+project:
+  type: book
+  output-dir: ../docs/notes
+
+book:
+  title: "$COURSE_TITLE - Course Notes"
+  author: "$AUTHOR_NAME"
+  chapters:
+    - index.qmd
+EOF
+
+# Create initial chapters and add them to config
+for i in $(seq 1 $NUM_LECTURES); do
+    CHAPTER_FILE="chapter-$(printf "%02d" $i).qmd"
+    
+    cat > "notes/$CHAPTER_FILE" << EOF
+---
+title: "Chapter $i: Topic Title"
+---
+
+# Introduction
+
+Write your chapter content here.
+
+## Section 1
+
+Content for section 1.
+
+## Section 2
+
+Content for section 2.
+
+## Summary
+
+Chapter summary and key takeaways.
+EOF
+    
+    # Add chapter to book config
+    echo "    - $CHAPTER_FILE" >> notes/_quarto.yml
+done
+
+# Finish the notes config
+cat >> notes/_quarto.yml << EOF
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+  typst:
+    toc: true
+    margin:
+      x: 2cm
+      y: 2cm
+EOF
+
+# Create notes index
+cat > notes/index.qmd << EOF
+---
+title: "$COURSE_TITLE - Course Notes"
+---
+
+# Welcome to the Course Notes
+
+These comprehensive notes cover all the material presented in the course.
+
+**Download Options:**
+- 📖 Read Online (you're here!)
+- [📄 Download PDF]($(echo "$COURSE_TITLE" | sed 's/ /-/g')-Notes.pdf)
+
+## Table of Contents
+
+The notes are organized into the following chapters:
+
+EOF
+
+# Add chapters to notes index
+for i in $(seq 1 $NUM_LECTURES); do
+    CHAPTER_NUM=$(printf "%02d" $i)
+    echo "$i. [Chapter $i: Topic Title](chapter-$CHAPTER_NUM.qmd)" >> notes/index.qmd
+done
+
+cat >> notes/index.qmd << EOF
+
+*Note: The PDF version is automatically generated and updated with each build.*
+
+## About These Notes
+
+**Author:** $AUTHOR_NAME  
+**Course:** $COURSE_TITLE
+
+These notes are designed to complement the lecture slides and provide a comprehensive reference for the course material.
+EOF
+
+print_status "Creating README and helper files..."
+
+# Create README
+cat > README.md << EOF
+# $COURSE_TITLE
+
+This repository contains the course materials for $COURSE_TITLE, including lecture slides and comprehensive notes.
+
+## Structure
+
+- \`slides/\` - Contains all lecture presentations (HTML slideshows)
+- \`notes/\` - Contains course notes (available as website and PDF)
+- \`docs/\` - Generated website files (created after rendering)
+
+## Usage
+
+### Building the Site
+
+To build the entire website:
+\`\`\`bash
+quarto render
+\`\`\`
+
+### Preview During Development
+
+To preview with live reload:
+\`\`\`bash
+quarto preview
+\`\`\`
+
+### Adding New Content
+
+**New Lecture:**
+1. Create new folder in \`slides/\` (e.g., \`lecture-04/\`)
+2. Add \`index.qmd\` with slide content
+3. Update \`slides-index.qmd\` to include new lecture
+4. Run \`quarto render\`
+
+**New Notes Chapter:**
+1. Create new \`.qmd\` file in \`notes/\`
+2. Update \`notes/_quarto.yml\` to include new chapter
+3. Update \`notes/index.qmd\` table of contents
+4. Run \`quarto render\`
+
+## Deployment
+
+The built site in \`docs/\` can be deployed to any web server or GitHub Pages.
+
+---
+
+Created with [Quarto](https://quarto.org/)
+EOF
+
+# Create .gitignore
+cat > .gitignore << EOF
+# Quarto
+docs/
+/.quarto/
+
+# R
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*~
+*.tmp
+EOF
+
+# Create a simple build script
+cat > build.sh << 'EOF'
+#!/bin/bash
+# Simple build script for the course website
+
+echo "Building Quarto course website..."
+quarto render
+
+echo "Build complete! Files are in docs/"
+echo "To preview locally, run: quarto preview"
+EOF
+
+chmod +x build.sh
+
+print_success "Quarto course project created successfully!"
+print_status "Project structure:"
+echo "📁 Course root"
+echo "├── 📄 _quarto.yml (main configuration)"
+echo "├── 📄 index.qmd (home page)"
+echo "├── 📄 styles.css (custom styles)"
+echo "├── 📄 slides-index.qmd (slides listing)"
+echo "├── 📁 slides/"
+echo "│   ├── 📄 _metadata.yml (slides configuration)"
+for i in $(seq 1 $NUM_LECTURES); do
+    LECTURE_NUM=$(printf "%02d" $i)
+    echo "│   └── 📁 lecture-$LECTURE_NUM/"
+done
+echo "└── 📁 notes/"
+echo "    ├── 📄 _quarto.yml (book configuration)"
+echo "    ├── 📄 index.qmd (notes home)"
+for i in $(seq 1 $NUM_LECTURES); do
+    CHAPTER_NUM=$(printf "%02d" $i)
+    echo "    └── 📄 chapter-$CHAPTER_NUM.qmd"
+done
+
+echo ""
+print_success "Next steps:"
+echo "1. Edit the content in the generated .qmd files"
+echo "2. Run 'quarto render' to build the site"
+echo "3. Run 'quarto preview' to preview locally"
+echo "4. Deploy the 'docs' folder to your web server"
+
+print_warning "Don't forget to:"
+echo "- Install Quarto if you haven't already: https://quarto.org/docs/get-started/"
+echo "- Customize the course title and content in the generated files"
+echo "- Add your own styling to styles.css"

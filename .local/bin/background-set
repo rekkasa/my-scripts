@@ -1,0 +1,6 @@
+#!/bin/bash
+rm ~/wallpaper
+BG=$(ls ~/Wallpapers | rofi -dmenu)
+ln -s ~/Wallpapers/$BG ~/wallpaper
+feh --bg-fill ~/Wallpapers/$BG
+
