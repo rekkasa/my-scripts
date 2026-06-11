@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+# install-r.sh
+# Installs a user-selected version of R from source into /opt/R/<version>.
+# Designed to run without a terminal — all prompts go through rofi.
+# Missing build dependencies are detected and the user is offered the chance
+# to install them before proceeding.
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+die() {
+    rofi -e "$1"
+    exit 1
+}
+
+notify() {
+    # Use notify-send when available, otherwise fall back to a rofi message
+    if command -v notify-send &>/dev/null; then
+        notify-send "R Installer" "$1"
+    else
+        rofi -e "$1"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 0. Dependency check
+# ---------------------------------------------------------------------------
+# rofi itself must be present before we can show any UI — hard-fail in the
+# terminal if it is missing (the user would have to launch this from a
+# launcher that already uses rofi, so this edge case is unlikely).
+command -v rofi &>/dev/null \
+    || { echo "ERROR: rofi is not installed. Install it first."; exit 1; }
+
+# Packages required to build R from source.
+# Each entry is  "apt-package-name:check-command-or-file"
+# The check field can be:
+#   - a bare command name  →  tested with  command -v
+#   - a path starting with /  →  tested with  [[ -e path ]]
+#   - an apt package name (fallback)  →  tested with  dpkg-query
+declare -A REQUIRED_PKGS
+REQUIRED_PKGS=(
+    # Build toolchain
+    [build-essential]="gcc"
+    [gfortran]="gfortran"
+    [make]="make"
+    # Download tools (curl already used above; wget used for the tarball)
+    [curl]="curl"
+    [wget]="wget"
+    # R build-time libraries — checked via dpkg since they ship no binary
+    [libreadline-dev]="pkg:libreadline-dev"
+    [libcurl4-openssl-dev]="pkg:libcurl4-openssl-dev"
+    [libssl-dev]="pkg:libssl-dev"
+    [libxml2-dev]="pkg:libxml2-dev"
+    [libbz2-dev]="pkg:libbz2-dev"
+    [liblzma-dev]="pkg:liblzma-dev"
+    [libpcre2-dev]="pkg:libpcre2-dev"
+    [zlib1g-dev]="pkg:zlib1g-dev"
+)
+
+_pkg_present() {
+    local pkg="$1" check="$2"
+    if [[ "${check}" == pkg:* ]]; then
+        # Library package — query dpkg directly
+        local pkgname="${check#pkg:}"
+        dpkg-query -W -f='${Status}' "${pkgname}" 2>/dev/null \
+            | grep -q "install ok installed"
+    elif [[ "${check}" == /* ]]; then
+        [[ -e "${check}" ]]
+    else
+        command -v "${check}" &>/dev/null
+    fi
+}
+
+MISSING_PKGS=()
+for pkg in "${!REQUIRED_PKGS[@]}"; do
+    _pkg_present "${pkg}" "${REQUIRED_PKGS[${pkg}]}" || MISSING_PKGS+=("${pkg}")
+done
+
+if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
+    # Sort for a tidy display
+    readarray -t MISSING_PKGS < <(printf '%s\n' "${MISSING_PKGS[@]}" | sort)
+    MISSING_LIST=$(printf '  • %s\n' "${MISSING_PKGS[@]}")
+
+    ANSWER=$(printf 'Yes, install them\nNo, abort' \
+        | rofi -dmenu \
+               -p "Missing dependencies" \
+               -mesg "The following packages are not installed:\n${MISSING_LIST}\n\nInstall them now?" \
+               -theme-str 'window {width: 480px;}' \
+               -no-custom \
+        ) || die "Dependency prompt cancelled. Aborting."
+
+    [[ "${ANSWER}" == "Yes, install them" ]] \
+        || die "Required packages are missing. Installation aborted."
+
+    # We need sudo to apt-install — prompt for the password now.
+    DEP_PASS=$(rofi -dmenu \
+                    -p "sudo password" \
+                    -mesg "Required to run: apt-get install ${MISSING_PKGS[*]}" \
+                    -password \
+                    -lines 0 \
+                    -theme-str 'window {width: 480px;}' \
+        ) || die "Password entry cancelled."
+
+    [[ -n "${DEP_PASS}" ]] || die "No password entered. Aborting."
+
+    echo "${DEP_PASS}" | sudo -S -v 2>/dev/null \
+        || die "Incorrect sudo password. Aborting."
+
+    notify "Installing missing packages:\n${MISSING_LIST}"
+
+    echo "${DEP_PASS}" | sudo -S apt-get install -y "${MISSING_PKGS[@]}" \
+        2>&1 | tee /tmp/r-apt-install.log \
+        || die "apt-get install failed.\nSee /tmp/r-apt-install.log for details."
+
+    notify "Dependencies installed successfully."
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Fetch available versions from CRAN
+# ---------------------------------------------------------------------------
+
+# DEP_PASS may already be set from the dependency-install step above.
+# Carry it forward so the user is not asked for their password twice.
+DEP_PASS="${DEP_PASS:-}"
+
+CRAN_BASE="https://cran.rstudio.com/src/base"
+
+notify "Fetching available R versions from CRAN…"
+
+# Parse the directory listing for R-X directories, extract version numbers,
+# then for each major-version directory list the .tar.gz files to get the
+# full patch versions.
+# Uses -oE (POSIX extended regex) + sed to avoid PCRE lookaheads, which can
+# fail with "missing closing parenthesis" on some grep builds.
+RAW_HTML=$(curl -fsSL "${CRAN_BASE}/" 2>/dev/null) \
+    || die "Could not reach CRAN (${CRAN_BASE}). Check your internet connection."
+
+# Collect all release tarballs: R-X.Y.Z.tar.gz
+AVAILABLE_VERSIONS=$(
+    # Step 1: find major-version directory names  (R-3/, R-4/, ...)
+    echo "${RAW_HTML}" \
+    | grep -oE 'R-[0-9]+/' \
+    | sed 's|R-||; s|/||' \
+    | sort -uV \
+    | while read -r major; do
+        dir_html=$(curl -fsSL "${CRAN_BASE}/R-${major}/" 2>/dev/null) || continue
+        # Step 2: find full version tarballs  (R-4.3.1.tar.gz, ...)
+        echo "${dir_html}" \
+            | grep -oE 'R-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' \
+            | sed 's|R-||; s|\.tar\.gz||' \
+            | sort -uV
+    done
+)
+
+[[ -n "${AVAILABLE_VERSIONS}" ]] \
+    || die "Could not parse any R versions from CRAN. The page layout may have changed."
+
+# ---------------------------------------------------------------------------
+# 2. Detect already-installed versions
+# ---------------------------------------------------------------------------
+
+INSTALLED_VERSIONS=()
+if [[ -d /opt/R ]]; then
+    while IFS= read -r -d '' dir; do
+        ver=$(basename "${dir}")
+        # Accept only directories whose name looks like X.Y.Z
+        [[ "${ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && INSTALLED_VERSIONS+=("${ver}")
+    done < <(find /opt/R -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Build the list of installable (not-yet-installed) versions
+# ---------------------------------------------------------------------------
+
+INSTALLABLE=()
+while IFS= read -r ver; do
+    skip=0
+    for installed in "${INSTALLED_VERSIONS[@]+"${INSTALLED_VERSIONS[@]}"}"; do
+        [[ "${ver}" == "${installed}" ]] && { skip=1; break; }
+    done
+    [[ "${skip}" -eq 0 ]] && INSTALLABLE+=("${ver}")
+done <<< "${AVAILABLE_VERSIONS}"
+
+[[ ${#INSTALLABLE[@]} -gt 0 ]] \
+    || die "All available CRAN versions are already installed under /opt/R/."
+
+# ---------------------------------------------------------------------------
+# 4. rofi version picker  (newest first for convenience)
+# ---------------------------------------------------------------------------
+
+ROFI_LIST=$(printf '%s\n' "${INSTALLABLE[@]}" | tac)
+
+SELECTED=$(echo "${ROFI_LIST}" \
+    | rofi -dmenu \
+           -p "Select R version to install" \
+           -mesg "Already installed: ${INSTALLED_VERSIONS[*]:-none}" \
+           -theme-str 'window {width: 420px;}' \
+           -no-custom \
+    ) || die "No version selected. Installation cancelled."
+
+[[ -n "${SELECTED}" ]] || die "No version selected. Installation cancelled."
+
+# Determine the major directory (R-4 for R-4.x.x, etc.)
+MAJOR=$(echo "${SELECTED}" | cut -d. -f1)
+TARBALL="R-${SELECTED}.tar.gz"
+TARBALL_URL="${CRAN_BASE}/R-${MAJOR}/${TARBALL}"
+INSTALL_PREFIX="/opt/R/${SELECTED}"
+
+# ---------------------------------------------------------------------------
+# 5. Prompt for sudo password via rofi (skip if already collected above)
+# ---------------------------------------------------------------------------
+
+if [[ -n "${DEP_PASS}" ]]; then
+    # Password was already validated during the dependency-install step.
+    SUDO_PASS="${DEP_PASS}"
+else
+    SUDO_PASS=$(rofi -dmenu \
+                     -p "sudo password" \
+                     -mesg "Required to install into ${INSTALL_PREFIX}" \
+                     -password \
+                     -lines 0 \
+                     -theme-str 'window {width: 420px;}' \
+        ) || die "Password entry cancelled."
+
+    [[ -n "${SUDO_PASS}" ]] || die "No password entered. Installation cancelled."
+
+    # Validate the password before proceeding so we fail early
+    echo "${SUDO_PASS}" | sudo -S -v 2>/dev/null \
+        || die "Incorrect sudo password. Installation cancelled."
+fi
+
+# Keep sudo alive in the background for the duration of the script
+( while true; do
+    echo "${SUDO_PASS}" | sudo -S -v 2>/dev/null
+    sleep 50
+  done ) &
+SUDO_KEEPALIVE_PID=$!
+# (keepalive is stopped by _cleanup trap set after WORK_DIR is created)
+
+# Wrapper: pipe the password to sudo so it never appears in shell history
+_sudo() { echo "${SUDO_PASS}" | sudo -S "$@"; }
+
+# ---------------------------------------------------------------------------
+# 6. Set up a working directory
+# ---------------------------------------------------------------------------
+
+WORK_DIR=$(mktemp -d /tmp/r-install-XXXXXX)
+# Use sudo for cleanup: the build runs as root, so files in WORK_DIR are
+# root-owned and cannot be removed by the regular user.
+_cleanup() {
+    kill "${SUDO_KEEPALIVE_PID}" 2>/dev/null || true
+    echo "${SUDO_PASS}" | sudo -S rm -rf "${WORK_DIR}" 2>/dev/null || true
+}
+trap '_cleanup' EXIT
+
+# ---------------------------------------------------------------------------
+# 7. Download the tarball
+# ---------------------------------------------------------------------------
+
+notify "Downloading R-${SELECTED}…"
+
+wget --quiet --show-progress \
+     --output-document="${WORK_DIR}/${TARBALL}" \
+     "${TARBALL_URL}" 2>&1 \
+    || die "Download failed.\nURL: ${TARBALL_URL}"
+
+# ---------------------------------------------------------------------------
+# 8. Extract
+# ---------------------------------------------------------------------------
+
+notify "Extracting R-${SELECTED}…"
+tar -xzf "${WORK_DIR}/${TARBALL}" -C "${WORK_DIR}"
+SRC_DIR="${WORK_DIR}/R-${SELECTED}"
+
+[[ -d "${SRC_DIR}" ]] \
+    || die "Expected source directory ${SRC_DIR} not found after extraction."
+
+# ---------------------------------------------------------------------------
+# 9. Configure, make, install
+# ---------------------------------------------------------------------------
+
+notify "Configuring R-${SELECTED} (this may take a while)…"
+cd "${SRC_DIR}"
+
+_sudo ./configure \
+    --prefix="${INSTALL_PREFIX}" \
+    --enable-R-shlib \
+    2>&1 | tee /tmp/r-configure-"${SELECTED}".log \
+    || die "configure failed.\nSee /tmp/r-configure-${SELECTED}.log for details."
+
+notify "Compiling R-${SELECTED}…"
+_sudo make -j"$(nproc)" \
+    2>&1 | tee /tmp/r-make-"${SELECTED}".log \
+    || die "make failed.\nSee /tmp/r-make-${SELECTED}.log for details."
+
+notify "Installing R-${SELECTED} to ${INSTALL_PREFIX}…"
+_sudo make install \
+    2>&1 | tee /tmp/r-install-"${SELECTED}".log \
+    || die "make install failed.\nSee /tmp/r-install-${SELECTED}.log for details."
+
+# ---------------------------------------------------------------------------
+# 10. Update symlinks in ~/.local/bin
+# ---------------------------------------------------------------------------
+
+LOCAL_BIN="${HOME}/.local/bin"
+mkdir -p "${LOCAL_BIN}"
+
+ln -sf "${INSTALL_PREFIX}/bin/R"       "${LOCAL_BIN}/R"
+ln -sf "${INSTALL_PREFIX}/bin/Rscript" "${LOCAL_BIN}/Rscript"
+
+# Make sure ~/.local/bin is on PATH for future sessions (idempotent)
+PROFILE_FILE="${HOME}/.profile"
+if ! grep -q '\.local/bin' "${PROFILE_FILE}" 2>/dev/null; then
+    {
+        echo ''
+        echo '# Added by install-r.sh'
+        echo 'export PATH="$HOME/.local/bin:$PATH"'
+    } >> "${PROFILE_FILE}"
+fi
+
+# ---------------------------------------------------------------------------
+# 11. Done
+# ---------------------------------------------------------------------------
+
+notify "R ${SELECTED} installed successfully!\n\nR  →  ${LOCAL_BIN}/R\nRscript  →  ${LOCAL_BIN}/Rscript\n\nLog files saved to /tmp/r-{configure,make,install}-${SELECTED}.log"

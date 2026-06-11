@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# switch-r-version.sh — interactively switch the active R version via rofi + dunst
+
+set -euo pipefail
+
+R_BASE="/opt/R"
+BIN_DIR="${HOME}/.local/bin"
+
+# ── Notification helper ──────────────────────────────────────────────────────
+# Sends a desktop notification via dunstify if available, falls back to notify-send.
+# Usage: notify <urgency> <summary> <body>
+#   urgency: low | normal | critical
+notify() {
+    local urgency="$1" summary="$2" body="$3"
+    if command -v dunstify &>/dev/null; then
+        dunstify -a "switch-r-version" -u "$urgency" "$summary" "$body"
+    elif command -v notify-send &>/dev/null; then
+        notify-send -u "$urgency" "$summary" "$body"
+    fi
+}
+
+# ── Sanity checks ────────────────────────────────────────────────────────────
+
+if [[ ! -d "$R_BASE" ]]; then
+    echo "ERROR: R installation directory '$R_BASE' not found." >&2
+    exit 1
+fi
+
+if ! command -v rofi &>/dev/null; then
+    echo "ERROR: rofi is not installed or not in PATH." >&2
+    exit 1
+fi
+
+mkdir -p "$BIN_DIR"
+
+# ── Collect available versions ───────────────────────────────────────────────
+
+mapfile -t versions < <(
+    find "$R_BASE" -maxdepth 1 -mindepth 1 -type d \
+        -exec test -x "{}/bin/R" \; \
+        -printf "%f\n" |
+    sort -V
+)
+
+if [[ ${#versions[@]} -eq 0 ]]; then
+    echo "ERROR: No R installations found under '$R_BASE'." >&2
+    exit 1
+fi
+
+# ── Determine currently active version (if any) ──────────────────────────────
+
+current=""
+if [[ -L "$BIN_DIR/R" ]]; then
+    link_target=$(readlink -f "$BIN_DIR/R" 2>/dev/null || true)
+    if [[ "$link_target" == "$R_BASE"/*/bin/R ]]; then
+        current=$(echo "$link_target" | sed "s|$R_BASE/||;s|/bin/R||")
+    fi
+fi
+
+# ── Build rofi menu entries (mark current version) ───────────────────────────
+
+menu_entries=()
+for v in "${versions[@]}"; do
+    if [[ "$v" == "$current" ]]; then
+        menu_entries+=("$v  ✓ active")
+    else
+        menu_entries+=("$v")
+    fi
+done
+
+# ── Show rofi prompt ─────────────────────────────────────────────────────────
+
+selected=$(
+    printf '%s\n' "${menu_entries[@]}" |
+    rofi -dmenu \
+         -i \
+         -p "R version" \
+         -mesg "Select the R version to activate" \
+         -no-custom \
+         -format "s"
+) || { echo "No selection made — exiting."; exit 0; }
+
+# Strip the " ✓ active" annotation if present
+selected_version="${selected%  ✓ active}"
+
+# ── Validate selection ───────────────────────────────────────────────────────
+
+R_BIN="$R_BASE/$selected_version/bin/R"
+RSCRIPT_BIN="$R_BASE/$selected_version/bin/Rscript"
+
+if [[ ! -x "$R_BIN" ]]; then
+    echo "ERROR: '$R_BIN' not found or not executable." >&2
+    exit 1
+fi
+
+if [[ ! -x "$RSCRIPT_BIN" ]]; then
+    echo "ERROR: '$RSCRIPT_BIN' not found or not executable." >&2
+    exit 1
+fi
+
+# ── Create symlinks ──────────────────────────────────────────────────────────
+
+ln -sfn "$R_BIN"       "$BIN_DIR/R"
+ln -sfn "$RSCRIPT_BIN" "$BIN_DIR/Rscript"
+
+echo "Switched to R $selected_version"
+echo "  ~/.local/bin/R       -> $R_BIN"
+echo "  ~/.local/bin/Rscript -> $RSCRIPT_BIN"
+
+# ── Desktop notification ─────────────────────────────────────────────────────
+
+if [[ -n "$current" && "$current" != "$selected_version" ]]; then
+    notify normal "R version switched" "R $current  →  R $selected_version"
+else
+    notify normal "R version set" "Active version: R $selected_version"
+fi
+
+# ── Remind user if ~/.local/bin is not in PATH ───────────────────────────────
+
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    echo ""
+    echo "NOTE: '$BIN_DIR' is not in your PATH."
+    echo "      Add the following line to your shell config (~/.bashrc / ~/.zshrc):"
+    echo "        export PATH=\"\$HOME/.local/bin:\$PATH\""
+fi
