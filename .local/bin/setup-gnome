@@ -1,0 +1,97 @@
+#!/bin/bash
+
+# --- CHECK DEPENDENCIES ---
+if ! command -v wmctrl &> /dev/null || ! command -v xprop &> /dev/null; then
+    echo "WARNING: wmctrl or x11-utils missing! Run: sudo apt install wmctrl x11-utils"
+    exit 1
+fi
+
+echo "Writing directly to the dconf database..."
+
+# 1. Force fixed workspaces
+dconf write /org/gnome/mutter/dynamic-workspaces false
+dconf write /org/gnome/desktop/wm/preferences/num-workspaces 9
+
+# 2. Bind workspace shortcuts and clear dock conflicts
+for i in {1..9}; do
+    dconf write /org/gnome/shell/keybindings/switch-to-application-$i "@as []"
+    dconf write /org/gnome/shell/keybindings/open-new-window-application-$i "@as []"
+    dconf write /org/gnome/shell/extensions/dash-to-dock/app-hotkey-$i "@as []"
+    dconf write /org/gnome/shell/extensions/dash-to-dock/app-shift-hotkey-$i "@as []"
+    dconf write /org/gnome/desktop/wm/keybindings/switch-to-workspace-$i "['<Super>$i']"
+    dconf write /org/gnome/desktop/wm/keybindings/move-to-workspace-$i "['<Super><Shift>$i']"
+done
+
+# 3. Configure ddterm
+echo "Setting ddterm toggle shortcut to Super+Enter..."
+dconf write /com/github/amezin/ddterm/ddterm-toggle-hotkey "['<Super>Return']"
+
+# 4. Configure Window Management
+echo "Setting Window Management shortcuts..."
+dconf write /org/gnome/desktop/wm/keybindings/maximize "['<Super>Up']"
+dconf write /org/gnome/desktop/wm/keybindings/unmaximize "['<Super>Down']"
+dconf write /org/gnome/mutter/keybindings/toggle-tiled-left "['<Super>Left']"
+dconf write /org/gnome/mutter/keybindings/toggle-tiled-right "['<Super>Right']"
+
+# 5. Clear EVERYTHING GNOME uses 'Tab' for so Super+Tab is 100% freed
+echo "Banishing GNOME's native Tab intercepts..."
+dconf write /org/gnome/desktop/wm/keybindings/switch-applications "@as []"
+dconf write /org/gnome/desktop/wm/keybindings/switch-applications-backward "@as []"
+dconf write /org/gnome/desktop/wm/keybindings/switch-windows "@as []"
+dconf write /org/gnome/desktop/wm/keybindings/switch-windows-backward "@as []"
+dconf write /org/gnome/desktop/wm/keybindings/switch-group "@as []"
+dconf write /org/gnome/desktop/wm/keybindings/switch-group-backward "@as []"
+dconf write /org/gnome/desktop/wm/keybindings/switch-panels "@as []"
+dconf write /org/gnome/desktop/wm/keybindings/switch-panels-backward "@as []"
+
+# 6. Build the Super+Tab custom history logic script
+echo "Creating the Super+Tab (Previous Active Workspace) logic script..."
+mkdir -p "$HOME/.local/bin"
+SCRIPT_PATH="$HOME/.local/bin/gnome-prev-workspace.sh"
+
+cat << 'EOF' > "$SCRIPT_PATH"
+#!/bin/bash
+CURRENT_WS=$(xprop -root _NET_CURRENT_DESKTOP | awk '{print $3}')
+# Extract valid window IDs safely
+STACK=$(xprop -root _NET_CLIENT_LIST_STACKING | sed -n 's/.*# \(.*\)/\1/p' | tr ',' ' ')
+REVERSED_STACK=$(echo $STACK | awk '{ for (i=NF; i>0; i--) print $i }')
+
+for WIN in $REVERSED_STACK; do
+    WS_INFO=$(xprop -id $WIN _NET_WM_DESKTOP 2>/dev/null)
+    if [[ "$WS_INFO" == *"_NET_WM_DESKTOP(CARDINAL)"* ]]; then
+        WS=$(echo "$WS_INFO" | awk '{print $3}')
+        # If it has a valid workspace AND is not sticky (4294967295) AND not on the current workspace
+        if [[ -n "$WS" && "$WS" != "4294967295" && "$WS" != "$CURRENT_WS" ]]; then
+            wmctrl -s "$WS"       # Force the desktop workspace to switch
+            wmctrl -i -a "$WIN"   # Force focus on the historical window
+            exit 0
+        fi
+    fi
+done
+EOF
+
+chmod +x "$SCRIPT_PATH"
+
+# 7. Register Custom Keybinding (Using python to safely manipulate the dconf array)
+echo "Binding Super+Tab in Custom Keybindings safely..."
+CUSTOM_PATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom-prev-ws/"
+
+python3 -c "
+import subprocess, ast
+try:
+    current = subprocess.check_output(['dconf', 'read', '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings']).decode('utf-8').strip()
+    if current.startswith('@as '): current = current[4:]
+    lst = ast.literal_eval(current) if current else []
+except:
+    lst = []
+if '$CUSTOM_PATH' not in lst:
+    lst.append('$CUSTOM_PATH')
+    subprocess.run(['dconf', 'write', '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings', str(lst)])
+"
+
+# 8. Write the exact execution details for Super+Tab
+dconf write "${CUSTOM_PATH}name" "'Previous Active Workspace'"
+dconf write "${CUSTOM_PATH}command" "'$SCRIPT_PATH'"
+dconf write "${CUSTOM_PATH}binding" "'<Super>Tab'"
+
+echo "Success! Settings fully injected."
