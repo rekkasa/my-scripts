@@ -94,4 +94,8 @@ dconf write "${CUSTOM_PATH}name" "'Previous Active Workspace'"
 dconf write "${CUSTOM_PATH}command" "'$SCRIPT_PATH'"
 dconf write "${CUSTOM_PATH}binding" "'<Super>Tab'"
 
+# 9. Free up Alt+Space (M-Space) for tmux
+echo "Unbinding Alt+Space (Window Menu) to free it for tmux..."
+dconf write /org/gnome/desktop/wm/keybindings/activate-window-menu "@as []"
+
 echo "Success! Settings fully injected."
