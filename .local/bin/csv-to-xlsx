@@ -1,0 +1,204 @@
+#!/bin/bash
+
+# CSV to XLSX Converter Script
+# Recursively converts all CSV files in a directory and subdirectories to XLSX
+# Usage: ./csv_to_xlsx.sh [OPTIONS] <directory>
+# Options:
+#   -d, --delete    Delete original CSV files after successful conversion
+#   -h, --help      Show this help message
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Variables
+DELETE_ORIGINALS=false
+TARGET_DIR=""
+CONVERTED_COUNT=0
+FAILED_COUNT=0
+SKIPPED_COUNT=0
+
+# Function to display help
+show_help() {
+    cat << EOF
+CSV to XLSX Converter
+=====================
+
+Recursively converts all CSV files in a directory and its subdirectories to XLSX format using LibreOffice.
+
+Usage: $0 [OPTIONS] <directory>
+
+Options:
+    -d, --delete    Delete original CSV files after successful conversion
+    -h, --help      Show this help message
+
+Examples:
+    # Convert all CSVs in /home/user/data directory
+    $0 /home/user/data
+
+    # Convert and delete original CSV files
+    $0 -d /home/user/data
+    $0 --delete /home/user/data
+
+EOF
+}
+
+# Function to validate inputs
+validate_inputs() {
+    # Check if LibreOffice is installed
+    if ! command -v libreoffice &> /dev/null; then
+        echo -e "${RED}Error: LibreOffice is not installed.${NC}"
+        echo "Install it with: sudo apt install libreoffice"
+        exit 1
+    fi
+
+    # Check if directory was provided
+    if [ -z "$TARGET_DIR" ]; then
+        echo -e "${RED}Error: No directory specified.${NC}"
+        show_help
+        exit 1
+    fi
+
+    # Check if directory exists
+    if [ ! -d "$TARGET_DIR" ]; then
+        echo -e "${RED}Error: Directory '$TARGET_DIR' does not exist.${NC}"
+        exit 1
+    fi
+
+    # Check if directory is readable
+    if [ ! -r "$TARGET_DIR" ]; then
+        echo -e "${RED}Error: Directory '$TARGET_DIR' is not readable.${NC}"
+        exit 1
+    fi
+}
+
+# Function to convert a single CSV file
+convert_csv() {
+    local csv_file="$1"
+    local csv_dir=$(dirname "$csv_file")
+    local csv_filename=$(basename "$csv_file")
+    local xlsx_filename="${csv_filename%.csv}.xlsx"
+    local xlsx_file="$csv_dir/$xlsx_filename"
+
+    # Skip if XLSX file already exists
+    if [ -f "$xlsx_file" ]; then
+        echo -e "${YELLOW}⊘ Skipped${NC} (XLSX exists): $csv_file"
+        ((SKIPPED_COUNT++))
+        return 1
+    fi
+
+    # Check if CSV file is writable (important for conversion)
+    if [ ! -w "$csv_file" ]; then
+        echo -e "${RED}✗ Failed${NC} (not readable): $csv_file"
+        ((FAILED_COUNT++))
+        return 1
+    fi
+
+    # Perform conversion
+    if libreoffice --headless --convert-to xlsx --outdir "$csv_dir" "$csv_file" > /dev/null 2>&1; then
+        echo -e "${GREEN}✓ Converted${NC}: $csv_file → $xlsx_file"
+        ((CONVERTED_COUNT++))
+
+        # Delete original CSV if requested and conversion was successful
+        if [ "$DELETE_ORIGINALS" = true ]; then
+            if rm "$csv_file" 2>/dev/null; then
+                echo -e "${BLUE}  └─ Deleted original CSV${NC}"
+            else
+                echo -e "${RED}  └─ Warning: Could not delete CSV file${NC}"
+            fi
+        fi
+        return 0
+    else
+        echo -e "${RED}✗ Failed${NC}: $csv_file"
+        ((FAILED_COUNT++))
+        return 1
+    fi
+}
+
+# Function to process all CSV files recursively
+process_directory() {
+    local dir="$1"
+    local csv_count=0
+
+    # Count CSV files first
+    csv_count=$(find "$dir" -type f -iname "*.csv" | wc -l)
+
+    if [ $csv_count -eq 0 ]; then
+        echo -e "${YELLOW}No CSV files found in $dir${NC}"
+        return 1
+    fi
+
+    echo -e "${BLUE}Found $csv_count CSV file(s) to process...${NC}\n"
+
+    # Process each CSV file found recursively
+    while IFS= read -r csv_file; do
+        convert_csv "$csv_file"
+    done < <(find "$dir" -type f -iname "*.csv")
+}
+
+# Function to display summary
+display_summary() {
+    echo ""
+    echo "========================================"
+    echo "Conversion Summary"
+    echo "========================================"
+    echo -e "${GREEN}Successfully converted: $CONVERTED_COUNT${NC}"
+    echo -e "${RED}Failed conversions: $FAILED_COUNT${NC}"
+    echo -e "${YELLOW}Skipped (already exist): $SKIPPED_COUNT${NC}"
+    echo "========================================"
+
+    if [ "$DELETE_ORIGINALS" = true ]; then
+        echo -e "${BLUE}Original CSV files deleted (as requested)${NC}"
+    fi
+}
+
+# Parse command-line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -d|--delete)
+            DELETE_ORIGINALS=true
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -*)
+            echo -e "${RED}Error: Unknown option '$1'${NC}"
+            show_help
+            exit 1
+            ;;
+        *)
+            TARGET_DIR="$1"
+            shift
+            ;;
+    esac
+done
+
+# Main execution
+echo -e "${BLUE}========================================${NC}"
+echo -e "${BLUE}CSV to XLSX Converter${NC}"
+echo -e "${BLUE}========================================${NC}\n"
+
+echo "Target directory: $TARGET_DIR"
+if [ "$DELETE_ORIGINALS" = true ]; then
+    echo -e "Mode: ${RED}Convert and Delete CSV files${NC}"
+else
+    echo "Mode: Convert only (keep CSV files)"
+fi
+echo ""
+
+# Validate inputs
+validate_inputs
+
+# Process directory
+if process_directory "$TARGET_DIR"; then
+    display_summary
+    exit 0
+else
+    display_summary
+    exit 1
+fi
