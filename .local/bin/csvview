@@ -1,0 +1,497 @@
+#!/usr/bin/env bash
+#
+# csvview — display CSV/TSV files in the terminal, nicely.
+#
+#   * real CSV parsing (quoted fields, embedded commas/newlines, "" escapes)
+#   * auto-detects the delimiter (, ; tab |)
+#   * aligned columns, numeric columns right-aligned
+#   * shrinks columns to fit your terminal, pages long output through less
+#
+# ---------------------------------------------------------------------------
+# INSTALL
+# ---------------------------------------------------------------------------
+#   chmod +x csvview.sh
+#   mv csvview.sh ~/.local/bin/csvview      # or anywhere on your $PATH
+#
+#   Or run it in place without installing:
+#       bash csvview.sh data.csv
+#
+#   Requires: bash, awk (gawk, mawk or BusyBox awk all work), and optionally
+#   less for paging. No other dependencies.
+#
+# ---------------------------------------------------------------------------
+# USAGE
+# ---------------------------------------------------------------------------
+#   csvview [options] [file ...]
+#
+#   With no file argument — or with "-" as the file — it reads stdin, so it
+#   drops into a pipeline anywhere:
+#       cat data.csv | csvview
+#       curl -s https://example.com/report.csv | csvview
+#       psql -Atc 'copy t to stdout csv header' | csvview
+#
+#   Pass several files and each is printed under its own filename heading:
+#       csvview jan.csv feb.csv mar.csv
+#
+#   Exit status: 0 on success, 1 if a file could not be read, 2 on a bad
+#   command line.
+#
+# ---------------------------------------------------------------------------
+# FLAGS
+# ---------------------------------------------------------------------------
+#   -d CHAR   Field delimiter. Write 'tab' or '\t' for tab-separated files.
+#             Default: auto-detected from the first record by counting , ; tab
+#             and | outside of quotes, so most files need no flag at all.
+#               csvview -d ';' euro.csv
+#               csvview -d tab data.tsv
+#
+#   -w N      Maximum column width, in characters. Anything longer is cut and
+#             marked with an ellipsis. Useful when one free-text column would
+#             otherwise dominate the table. Default: no cap beyond whatever is
+#             needed to fit the terminal.
+#               csvview -w 20 comments.csv
+#
+#   -N N      Show only the first N data rows (the header does not count
+#             towards N). A footer notes how many rows were left out. Good for
+#             peeking at the top of a large export.
+#               csvview -N 25 huge.csv
+#
+#   -n        Number the rows. Numbering counts data rows, so the first row
+#             under the header is 1.
+#
+#   -H        The file has no header row: treat every line as data, and skip
+#             the header styling and separator.
+#               csvview -H -d tab raw.tsv
+#
+#   -R        Raw numbers: print them exactly as they appear in the file.
+#             By default, every column that holds nothing but numbers is
+#             padded with trailing zeros so all its values carry the same
+#             number of decimal places — in a column containing 12500.50 and
+#             980, the latter is shown as 980.00, so the decimal points line
+#             up. Columns of whole numbers are left as whole numbers, and no
+#             value is ever rounded or shortened. Use -R to switch this off.
+#
+#   -s STYLE  Output style, one of:
+#               unicode  box-drawing borders, coloured header   (default)
+#               ascii    the same table using + - | =, for terminals or logs
+#                        that cannot handle box-drawing characters
+#               plain    no borders at all, columns separated by two spaces —
+#                        the friendliest style for piping into grep, awk, diff
+#               md       a GitHub-flavoured Markdown table, alignment markers
+#                        included, ready to paste into a README or ticket
+#               csvview -s md data.csv > table.md
+#
+#   -C        Never colourise. Colour is on by default when writing to a
+#             terminal and off when redirected to a file or pipe, so this is
+#             only needed to force it off in a terminal. The NO_COLOR
+#             environment variable has the same effect, and -s md is always
+#             uncoloured.
+#
+#   -P        Never page. By default, terminal output is piped through
+#             "less -SRF": it quits immediately if the table fits on one
+#             screen, and otherwise lets you scroll, including sideways
+#             through tables that are wider than the window. Use -P to dump
+#             everything straight to the terminal instead.
+#
+#   -h        Print the short help summary and exit.
+#
+#   Flags can be combined in the usual way: csvview -nHC -w 30 -s ascii f.csv
+#
+# ---------------------------------------------------------------------------
+# NOTES
+# ---------------------------------------------------------------------------
+#   * Columns whose values are all numeric are right-aligned automatically,
+#     and their decimal places are padded out to match (see -R). Percentages
+#     and thousands separators survive the padding: 7.5% next to 10% becomes
+#     7.5% and 10.0%. Values in exponent notation, and comma-decimal values
+#     sitting next to comma-separated thousands, are too ambiguous to pad and
+#     are left untouched.
+#   * In files that do not use a comma as the delimiter, a comma is accepted
+#     as the decimal mark, so a Greek or German export delimited by ";" with
+#     values like 12,5 still aligns correctly.
+#   * A UTF-8 byte-order mark (common in CSVs exported from Excel) and CRLF
+#     line endings are stripped silently.
+#   * Newlines inside a quoted field are shown as a small return symbol so
+#     that one record always stays on one line.
+#   * Rows with too few fields are padded; rows with extra fields widen the
+#     table for everyone.
+#   * Column widths are measured in characters, assuming each takes one
+#     terminal cell. Accented Latin, Greek and Cyrillic are fine; CJK and
+#     emoji are drawn double-width by most terminals and will sit slightly
+#     wide.
+#   * Terminal width comes from tput, then stty, then $COLUMNS. If none of
+#     them answer (in a pipe, say) no width limit is applied.
+#
+
+set -uo pipefail
+
+prog=${0##*/}
+
+delim=""
+maxw=0
+minw=5
+numbers=0
+header=1
+limit=0
+paddec=1
+style="unicode"
+want_color="auto"
+want_pager="auto"
+
+die() { printf '%s: %s\n' "$prog" "$*" >&2; exit 2; }
+
+usage() {
+  cat <<EOF
+$prog — display CSV files in the terminal, nicely.
+
+Usage: $prog [options] [file ...]      (reads stdin when no file is given)
+
+Options:
+  -d CHAR   field delimiter; 'tab' or '\\t' for tabs   (default: auto-detect)
+  -w N      maximum column width, in characters
+  -N N      show only the first N data rows
+  -n        number the rows
+  -H        file has no header row
+  -R        raw numbers: do not pad decimals
+  -s STYLE  unicode (default) | ascii | plain | md
+  -C        never colourise
+  -P        never page through less
+  -h        this help
+
+Examples:
+  $prog sales.csv
+  $prog -n -w 24 big.csv
+  $prog -s md data.csv > table.md
+  psql -Atc 'copy t to stdout csv header' | $prog
+EOF
+}
+
+while getopts ':d:w:N:nHRs:CPh' opt; do
+  case $opt in
+    d) delim=$OPTARG ;;
+    w) maxw=$OPTARG ;;
+    N) limit=$OPTARG ;;
+    n) numbers=1 ;;
+    H) header=0 ;;
+    R) paddec=0 ;;
+    s) style=$OPTARG ;;
+    C) want_color=never ;;
+    P) want_pager=never ;;
+    h) usage; exit 0 ;;
+    :)  die "option -$OPTARG requires an argument" ;;
+    \?) die "unknown option -$OPTARG (try -h)" ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+case $delim in tab|'\t') delim=$'\t' ;; esac
+case $style in unicode|ascii|plain|md) ;; *) die "unknown style '$style'" ;; esac
+[[ $maxw  =~ ^[0-9]+$ ]] || die "-w needs a number"
+[[ $limit =~ ^[0-9]+$ ]] || die "-N needs a number"
+
+# ---- pager / colour ---------------------------------------------------------
+
+pager=""
+if [[ $want_pager != never && -t 1 ]] && command -v less >/dev/null 2>&1; then
+  pager=1
+fi
+
+color=1
+[[ -t 1 || -n $pager ]] || color=0
+[[ $want_color == never || -n ${NO_COLOR:-} || $style == md ]] && color=0
+
+if (( color )); then
+  c_hdr=$'\033[1;36m'; c_bor=$'\033[38;5;240m'; c_dim=$'\033[2m'; rst=$'\033[0m'
+else
+  c_hdr=""; c_bor=""; c_dim=""; rst=""
+fi
+
+# ---- terminal width ---------------------------------------------------------
+
+cols=""
+[[ -t 1 ]] && cols=$(tput cols 2>/dev/null)
+if [[ -z $cols ]]; then
+  cols=$( { stty size </dev/tty | cut -d' ' -f2; } 2>/dev/null )
+fi
+[[ $cols =~ ^[0-9]+$ ]] || cols=${COLUMNS:-0}
+[[ $cols =~ ^[0-9]+$ ]] || cols=0
+
+# ---- the renderer -----------------------------------------------------------
+
+read -r -d '' awk_prog <<'AWK'
+function rep(c, n,   s) { s = ""; while (n-- > 0) s = s c; return s }
+
+# display width / truncation, working in both multibyte and byte-oriented awks
+function dwidth(s,   i, n, w) {
+  if (MB) return length(s)
+  n = length(s); w = 0
+  for (i = 1; i <= n; i++) if (!(substr(s, i, 1) in CONT)) w++
+  return w
+}
+function dtrunc(s, w,   i, n, cnt, c, out) {
+  if (w <= 0) return ""
+  if (dwidth(s) <= w) return s
+  if (w == 1) return ELL
+  if (MB) return substr(s, 1, w - dwidth(ELL)) ELL
+  out = ""; cnt = 0; n = length(s)
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (!(c in CONT)) { if (cnt >= w - dwidth(ELL)) break; cnt++ }
+    out = out c
+  }
+  return out ELL
+}
+function pad(s, w, right,   d) {
+  d = w - dwidth(s); if (d < 0) d = 0
+  return right ? rep(" ", d) s : s rep(" ", d)
+}
+function paint(s, c) { return (COLOR && c != "") ? c s RST : s }
+
+# ---- CSV parsing ----
+function count_out(s, d,   i, c, inq, n) {
+  n = 0; inq = 0
+  for (i = 1; i <= length(s); i++) {
+    c = substr(s, i, 1)
+    if (c == "\"") { if (inq && substr(s, i+1, 1) == "\"") i++; else inq = !inq }
+    else if (!inq && c == d) n++
+  }
+  return n
+}
+function detect(s,   i, n, best, bestn) {
+  bestn = 0; best = ","
+  for (i = 1; i <= 4; i++) { n = count_out(s, CAND[i]); if (n > bestn) { bestn = n; best = CAND[i] } }
+  return best
+}
+# returns field count, or -1 when a quote is still open (record continues)
+function split_csv(s, arr, i, n, c, cur, inq, len) {
+  len = length(s); n = 0; cur = ""; inq = 0
+  for (i = 1; i <= len; i++) {
+    c = substr(s, i, 1)
+    if (inq) {
+      if (c == "\"") { if (substr(s, i+1, 1) == "\"") { cur = cur "\""; i++ } else inq = 0 }
+      else cur = cur c
+    } else if (c == "\"") inq = 1
+    else if (c == DELIM) { arr[++n] = cur; cur = "" }
+    else cur = cur c
+  }
+  if (inq) return -1
+  arr[++n] = cur
+  return n
+}
+# 1 = numeric, 3 = numeric written with a comma as the decimal mark,
+# 2 = empty (ignored when deciding alignment), 0 = not a number
+function isnum(s) {
+  gsub(/^[ \t]+|[ \t]+$/, "", s)
+  if (s == "") return 2
+  if (s ~ /^[-+]?[0-9]+(,[0-9][0-9][0-9])*(\.[0-9]+)?%?$/) return 1
+  if (s ~ /^[-+]?([0-9]+)?\.?[0-9]+([eE][-+]?[0-9]+)?%?$/) return 1
+  if (DELIM != "," && s ~ /^[-+]?[0-9]+(\.[0-9][0-9][0-9])*,[0-9]+%?$/) return 3
+  return 0
+}
+# how many digits follow the decimal mark
+function decs(s, sep,   p) {
+  gsub(/^[ \t]+|[ \t]+$/, "", s)
+  if (substr(s, length(s), 1) == "%") s = substr(s, 1, length(s) - 1)
+  p = index(s, sep)
+  return p ? length(s) - p : 0
+}
+# pad with trailing zeros so the value shows nd decimal places
+function fixdec(s, nd, sep,   suf, p, n) {
+  gsub(/^[ \t]+|[ \t]+$/, "", s)
+  if (s == "") return s
+  suf = ""
+  if (substr(s, length(s), 1) == "%") { suf = "%"; s = substr(s, 1, length(s) - 1) }
+  p = index(s, sep)
+  if (p == 0) { s = s sep; n = 0 } else n = length(s) - p
+  while (n++ < nd) s = s "0"
+  return s suf
+}
+function store(n,   i, v) {
+  if (n == 1 && F[1] == "") return                       # blank line
+  if (LIMIT > 0 && stored >= LIMIT + HEADER) { extra++; return }
+  stored++
+  if (n > ncol) ncol = n
+  for (i = 1; i <= n; i++) {
+    v = F[i]
+    gsub(/\n/, NLS, v); gsub(/\t/, " ", v)
+    cell[stored, i] = v
+  }
+}
+
+BEGIN {
+  MB = (length("é") == 1)
+  if (!MB) for (i = 128; i < 192; i++) CONT[sprintf("%c", i)] = 1
+  CAND[1] = ","; CAND[2] = ";"; CAND[3] = "\t"; CAND[4] = "|"
+  BOMB = sprintf("%c%c%c", 239, 187, 191); BOMU = sprintf("%c", 65279)
+  ELL = (STYLE == "unicode") ? "…" : "~"
+  NLS = (STYLE == "unicode") ? "⏎ " : "\\n"
+}
+
+{
+  line = $0
+  sub(/\r$/, "", line)
+  if (FNR == 1) {
+    if (index(line, BOMB) == 1) line = substr(line, 4)
+    else if (index(line, BOMU) == 1) line = substr(line, 2)
+  }
+  rec = have ? pending "\n" line : line
+  if (DELIM == "") DELIM = detect(rec)
+  n = split_csv(rec, F)
+  if (n < 0) { pending = rec; have = 1; next }           # quoted field spans lines
+  have = 0; pending = ""
+  store(n)
+}
+
+END {
+  if (have) { n = split_csv(pending "\"", F); if (n > 0) store(n) }
+  if (stored == 0) { print paint("(no rows)", DIM); exit }
+
+  hdr = HEADER ? 1 : 0
+  first = hdr + 1
+  ndata = stored - hdr
+  FC = NUM ? 0 : 1
+
+  # classify each column, then pad decimals — both must happen before the
+  # column widths are measured
+  for (i = 1; i <= ncol; i++) {
+    alln = 1; anyn = 0; expo = 0; th = 0; cd = 0; md = 0
+    for (r = first; r <= stored; r++) {
+      v = cell[r, i]
+      t = isnum(v)
+      if (t == 2) continue
+      if (t == 0) { alln = 0; break }
+      anyn = 1
+      if (v ~ /[eE]/) expo = 1
+      if (t == 3) cd = 1
+      else if (v ~ /[0-9],[0-9][0-9][0-9]/) th = 1
+    }
+    RA[i] = (alln && anyn)                       # right-align numeric columns
+    SEP[i] = cd ? "," : "."
+    DEC[i] = 0
+    # skip exponent notation, and columns mixing comma-as-decimal with
+    # comma-as-thousands-separator, where the intent is ambiguous
+    if (RA[i] && PADDEC && !expo && !(cd && th)) {
+      for (r = first; r <= stored; r++) { d = decs(cell[r, i], SEP[i]); if (d > md) md = d }
+      DEC[i] = md
+    }
+    if (DEC[i] > 0)
+      for (r = first; r <= stored; r++)
+        if (cell[r, i] != "") cell[r, i] = fixdec(cell[r, i], DEC[i], SEP[i])
+  }
+
+  for (r = 1; r <= stored; r++)
+    for (i = 1; i <= ncol; i++) { w = dwidth(cell[r, i]); if (w > W[i]) W[i] = w }
+  for (i = 1; i <= ncol; i++) {
+    if (MAXW > 0 && W[i] > MAXW) W[i] = MAXW
+    if (W[i] < 1) W[i] = 1
+  }
+  if (NUM) { W[0] = dwidth("" ndata); if (W[0] < 1) W[0] = 1; RA[0] = 1 }
+
+  gap  = (STYLE == "plain") ? 2 : 3              # squeeze to fit the terminal
+  edge = (STYLE == "plain") ? 0 : 1
+  if (TERMW > 0) {
+    while (1) {
+      tot = edge
+      for (i = FC; i <= ncol; i++) tot += W[i] + gap
+      if (STYLE == "plain") tot -= gap
+      if (tot <= TERMW) break
+      j = -1; big = MINW
+      for (i = 1; i <= ncol; i++) if (W[i] > big) { big = W[i]; j = i }
+      if (j < 0) break
+      W[j]--
+    }
+  }
+  render()
+}
+
+function cellv(r, i, ishdr) {
+  if (i > 0) return cell[r, i]
+  return ishdr ? "#" : (r - hdr) ""
+}
+function rule(l, m, r, f,   i, s) {
+  s = l
+  for (i = FC; i <= ncol; i++) s = s rep(f, W[i] + 2) ((i < ncol) ? m : r)
+  return paint(s, BOR)
+}
+function rowline(r, ishdr,   i, s, v) {
+  s = ""
+  for (i = FC; i <= ncol; i++) {
+    v = pad(dtrunc(cellv(r, i, ishdr), W[i]), W[i], (i == 0) ? 1 : RA[i])
+    if (ishdr) v = paint(v, HDR); else if (i == 0) v = paint(v, DIM)
+    if (STYLE == "plain") s = s (i > FC ? "  " : "") v
+    else                  s = s paint(V, BOR) " " v " "
+  }
+  if (STYLE == "plain") { if (!COLOR) sub(/ +$/, "", s); return s }
+  return s paint(V, BOR)
+}
+function mdrule(   i, s, w) {
+  s = "|"
+  for (i = FC; i <= ncol; i++) {
+    w = W[i] + 2
+    s = s (RA[i] ? rep("-", w - 1) ":" : rep("-", w)) "|"
+  }
+  return s
+}
+function render(   r) {
+  if (STYLE == "unicode") { V = "│"
+    print rule("┌", "┬", "┐", "─")
+    if (hdr) { print rowline(1, 1); print rule("╞", "╪", "╡", "═") }
+    for (r = hdr + 1; r <= stored; r++) print rowline(r, 0)
+    print rule("└", "┴", "┘", "─")
+  } else if (STYLE == "ascii") { V = "|"
+    print rule("+", "+", "+", "-")
+    if (hdr) { print rowline(1, 1); print rule("+", "+", "+", "=") }
+    for (r = hdr + 1; r <= stored; r++) print rowline(r, 0)
+    print rule("+", "+", "+", "-")
+  } else if (STYLE == "md") { V = "|"
+    print rowline(hdr ? 1 : 0, hdr)
+    print mdrule()
+    for (r = hdr + 1; r <= stored; r++) print rowline(r, 0)
+    return
+  } else {
+    if (hdr) print rowline(1, 1)
+    for (r = hdr + 1; r <= stored; r++) print rowline(r, 0)
+  }
+  if (STYLE == "unicode" || STYLE == "ascii") {
+    note = ndata " row" (ndata == 1 ? "" : "s") " x " ncol " column" (ncol == 1 ? "" : "s")
+    if (extra > 0) note = note "  (" extra " more not shown)"
+    if (!hdr) note = note "  (no header)"
+    print paint(note, DIM)
+  }
+}
+AWK
+
+run_awk() {
+  awk -v DELIM="$delim" -v MAXW="$maxw" -v MINW="$minw" -v LIMIT="$limit" \
+      -v NUM="$numbers" -v HEADER="$header" -v PADDEC="$paddec" -v STYLE="$style" -v COLOR="$color" \
+      -v TERMW="$cols" -v HDR="$c_hdr" -v BOR="$c_bor" -v DIM="$c_dim" -v RST="$rst" \
+      -- "$awk_prog" "$@"
+}
+
+main() {
+  local rc=0
+  if [[ $# -eq 0 ]]; then
+    run_awk -
+  else
+    local first=1 f
+    for f in "$@"; do
+      if [[ $f != - && ! -r $f ]]; then
+        printf '%s: cannot read %s\n' "$prog" "$f" >&2
+        rc=1
+        continue
+      fi
+      (( first )) || echo
+      (( $# > 1 )) && printf '%s%s%s\n' "$c_hdr" "$f" "$rst"
+      run_awk "$f"
+      first=0
+    done
+  fi
+  return $rc
+}
+
+if [[ -n $pager ]]; then
+  main "$@" | less -SR -F -X
+  exit "${PIPESTATUS[0]}"
+else
+  main "$@"
+fi
